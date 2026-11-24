@@ -20,6 +20,7 @@ except ImportError:
     sys.exit("openpyxl が必要です: pip install openpyxl pillow")
 
 EXCEL_EXT = (".xlsx", ".xlsm")
+OFFICE_EXT = EXCEL_EXT + (".pptx",)
 SELF = os.path.abspath(__file__)
 
 
@@ -72,7 +73,8 @@ WB = "(ブック全体)"
 KIND_LABEL = [  # (対象IDの正規表現, ラベル)
     (r"^[A-Z]+\d+$", "書式等"), (r"^col:|^row:", "列・行"), (r"^merge:", "セル結合"),
     (r"^cf:", "条件付き書式"), (r"^dv:", "入力規則"), (r"^chart", "グラフ"),
-    (r"^image@|^media:", "画像"), (r"^sheet$", "シート設定"), (r"^name:", "名前定義"),
+    (r"^image@|^media:", "画像"),
+    (r"^slide$", "スライド"), (r"^shape:", "図形"), (r"^deck$", "スライドサイズ"), (r"^sheet$", "シート設定"), (r"^name:", "名前定義"),
 ]
 
 
@@ -173,6 +175,8 @@ def dxf_desc(dxf, put):
 
 
 def snapshot(data, cached=False):
+    if is_pptx(data):
+        return snapshot_pptx(data)
     """xlsxバイト列 -> ({(シート, 対象, 属性): 文字列}, シート順)"""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -342,16 +346,235 @@ def snapshot(data, cached=False):
 
 
 def dump_text(data):
-    """textconv用: ワークブック全体を「シート!対象<TAB>属性<TAB>値」形式のテキストに展開"""
+    """textconv用: 全体を「対象<TAB>属性<TAB>値」形式のテキストに展開"""
     props, order = snapshot(data)
     out = []
     for name in order + [WB]:
-        out.append(f"=== Sheet: {name} ===")
-        items = sorted((k for k in props if k[0] == name),
+        label = props.get((name, "slide", "_label"))
+        out.append(f"=== Slide: {label} ===" if label else f"=== Sheet: {name} ===")
+        items = sorted((k for k in props if k[0] == name and not k[2].startswith("_")),
                        key=lambda k: (target_key(k[1]), k[2]))
         for _, target, prop in items:
             out.append(f"{target}\t{prop}\t{props[(name, target, prop)]}")
     return "\n".join(out) + "\n"
+
+
+# ------------------------------------------------------------ PowerPoint (.pptx)
+EMU_PT = 12700.0
+THEME_TAGS = {"TEXT_1": "dk1", "BACKGROUND_1": "lt1", "TEXT_2": "dk2", "BACKGROUND_2": "lt2",
+              "DARK_1": "dk1", "LIGHT_1": "lt1", "DARK_2": "dk2", "LIGHT_2": "lt2",
+              "HYPERLINK": "hlink", "FOLLOWED_HYPERLINK": "folHlink"}
+CONTENT_PREFIX = ("text", "img", "cell:", "chart", "series", "kind")
+
+
+def is_pptx(data):
+    if not data:
+        return False
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            return "ppt/presentation.xml" in z.namelist()
+    except Exception:
+        return False
+
+
+def pptx_theme(z):
+    names = sorted(n for n in z.namelist() if re.match(r"ppt/theme/theme\d+\.xml$", n))
+    if not names:
+        return {}
+    x = z.read(names[0]).decode("utf-8", "replace")
+    out = {}
+    for tag, rgb, sysc in re.findall(
+            r'<a:(dk1|lt1|dk2|lt2|accent\d|hlink|folHlink)>\s*<a:(?:srgbClr val="([0-9A-Fa-f]{6})"'
+            r'|sysClr [^>]*?lastClr="([0-9A-Fa-f]{6})")', x):
+        out[tag] = (rgb or sysc).upper()
+    return out
+
+
+def pcolor(c, theme):
+    try:
+        from pptx.enum.dml import MSO_COLOR_TYPE
+        if c is None or c.type is None:
+            return None
+        if c.type == MSO_COLOR_TYPE.RGB:
+            return str(c.rgb)
+        nm = getattr(c.theme_color, "name", str(c.theme_color))
+        key = THEME_TAGS.get(nm) or (f"accent{nm[-1]}" if nm.startswith("ACCENT_") else None)
+        return theme.get(key) or f"theme:{nm}"
+    except Exception:
+        return None
+
+
+def walk_shapes(shapes, tf=(1.0, 1.0, 0.0, 0.0)):
+    """グループを展開しつつ、スライド上の絶対座標(EMU)を返す"""
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    sx, sy, dx, dy = tf
+    for sh in shapes:
+        l, t, w, h = (getattr(sh, a, None) or 0 for a in ("left", "top", "width", "height"))
+        geo = (l * sx + dx, t * sy + dy, w * sx, h * sy)
+        yield sh, geo
+        if safe(lambda: sh.shape_type) == MSO_SHAPE_TYPE.GROUP:
+            x = safe(lambda: sh._element.grpSpPr.xfrm)
+            cx = safe(lambda: x.chExt.cx) or w or 1
+            cy = safe(lambda: x.chExt.cy) or h or 1
+            ox = safe(lambda: x.chOff.x) or 0
+            oy = safe(lambda: x.chOff.y) or 0
+            nsx, nsy = geo[2] / cx, geo[3] / cy
+            yield from walk_shapes(sh.shapes, (nsx, nsy, geo[0] - ox * nsx, geo[1] - oy * nsy))
+
+
+def read_text(tf, theme):
+    from lxml import etree
+    from pptx.text.text import _Run
+    paras = []
+    for p in tf.paragraphs:
+        runs = []
+        for el in p._p.iterchildren():
+            tag = etree.QName(el).localname
+            if tag == "br":
+                runs.append({"t": "\n"})
+            elif tag == "r":
+                r = _Run(el, p)
+                f = r.font
+                col = pcolor(f.color, theme) if safe(lambda: f.color.type) is not None else None
+                runs.append({"t": r.text, "b": bool(f.bold), "i": bool(f.italic),
+                             "u": bool(f.underline), "sz": f.size.pt if f.size else None, "c": col})
+        paras.append({"al": getattr(p.alignment, "name", None), "runs": runs})
+    return paras
+
+
+def read_shape(sh, geo, z, theme):
+    from pptx.enum.dml import MSO_FILL
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    st = safe(lambda: sh.shape_type)
+    d = {"id": sh.shape_id, "name": sh.name, "x": geo[0], "y": geo[1], "w": geo[2], "h": geo[3],
+         "rot": round(safe(lambda: sh.rotation, 0) or 0, 1), "z": z, "kind": "shape"}
+    if st == MSO_SHAPE_TYPE.GROUP:
+        d["kind"] = "group"
+    elif st == MSO_SHAPE_TYPE.PICTURE:
+        d["kind"] = "picture"
+        blob = safe(lambda: sh.image.blob)
+        if blob:
+            d["img_md5"] = hashlib.md5(blob).hexdigest()[:10]
+            d["_blob"] = blob
+            d["_ext"] = safe(lambda: sh.image.ext, "png")
+    elif safe(lambda: sh.has_table):
+        d["kind"] = "table"
+        d["table"] = [[c.text for c in row.cells] for row in sh.table.rows]
+    elif safe(lambda: sh.has_chart):
+        d["kind"] = "chart"
+        ch = sh.chart
+        series = []
+        for plot in ch.plots:
+            cats = [str(c) for c in safe(lambda: list(plot.categories), [])]
+            for s in plot.series:
+                series.append({"name": s.name, "cats": cats, "vals": [v for v in s.values]})
+        d["chart"] = {"type": getattr(ch.chart_type, "name", str(ch.chart_type)),
+                      "title": safe(lambda: ch.chart_title.text_frame.text) if ch.has_title else None,
+                      "series": series}
+    elif safe(lambda: sh.has_text_frame):
+        d["kind"] = "text"
+    if safe(lambda: sh.has_text_frame) and st != MSO_SHAPE_TYPE.GROUP:
+        d["paras"] = read_text(sh.text_frame, theme)
+    try:
+        if sh.fill.type == MSO_FILL.SOLID:
+            d["fill"] = pcolor(sh.fill.fore_color, theme)
+    except Exception:
+        pass
+    try:
+        if sh.line.fill.type == MSO_FILL.SOLID:
+            d["line"] = pcolor(sh.line.color, theme)
+            d["lw"] = round(sh.line.width.pt, 2) if sh.line.width else None
+    except Exception:
+        pass
+    return d
+
+
+def read_pptx(data):
+    from pptx import Presentation
+    prs = Presentation(io.BytesIO(data))
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        theme = pptx_theme(z)
+    out = {"w": prs.slide_width, "h": prs.slide_height, "slides": []}
+    for pos, slide in enumerate(prs.slides, 1):
+        title = (safe(lambda: slide.shapes.title.text_frame.text) or "").strip().replace("\n", " ")
+        layout = safe(lambda: slide.slide_layout.name) or ""
+        bg = None
+        try:
+            from pptx.enum.dml import MSO_FILL
+            if slide.background.fill.type == MSO_FILL.SOLID:
+                bg = pcolor(slide.background.fill.fore_color, theme)
+        except Exception:
+            pass
+        notes = safe(lambda: slide.notes_slide.notes_text_frame.text) if slide.has_notes_slide else ""
+        out["slides"].append({
+            "key": f"slide:{slide.slide_id}", "pos": pos, "layout": layout, "bg": bg,
+            "label": f"{pos}. {title or layout or 'スライド'}", "notes": notes or "",
+            "hidden": slide._element.get("show") == "0",
+            "shapes": [read_shape(sh, g, i, theme)
+                       for i, (sh, g) in enumerate(walk_shapes(slide.shapes))]})
+    return out
+
+
+def flat(s):
+    return str(s).replace("\r", "").replace("\v", "⏎").replace("\n", "⏎")
+
+
+def snapshot_pptx(data):
+    deck = read_pptx(data)
+    props, order = {}, []
+
+    def mk(key):
+        def put(target, prop, val):
+            if val is not None and val != "":
+                props[(key, target, prop)] = str(val)
+        return put
+
+    mk(WB)("deck", "size", f"{deck['w'] / EMU_PT:.0f}x{deck['h'] / EMU_PT:.0f}pt")
+    for sl in deck["slides"]:
+        order.append(sl["key"])
+        put = mk(sl["key"])
+        put("slide", "_label", sl["label"])
+        put("slide", "position", sl["pos"])
+        put("slide", "layout", sl["layout"])
+        put("slide", "notes", flat(sl["notes"]))
+        put("slide", "hidden", True if sl["hidden"] else None)
+        put("slide", "background", sl["bg"])
+        for s in sl["shapes"]:
+            t = f"shape:{s['id']}"
+            put(t, "name", s["name"])
+            put(t, "kind", s["kind"])
+            put(t, "pos", f"{s['x'] / EMU_PT:.1f},{s['y'] / EMU_PT:.1f}")
+            put(t, "size", f"{s['w'] / EMU_PT:.1f}x{s['h'] / EMU_PT:.1f}")
+            put(t, "rotation", s["rot"] or None)
+            put(t, "z", s["z"])
+            put(t, "fill", s.get("fill"))
+            put(t, "line", s.get("line"))
+            put(t, "line_width", s.get("lw"))
+            put(t, "img", s.get("img_md5"))
+            if "paras" in s:
+                text = "\n".join("".join(r["t"] for r in p["runs"]) for p in s["paras"])
+                put(t, "text", flat(text))
+                fm = set()
+                for p in s["paras"]:
+                    for r in p["runs"]:
+                        if r["t"].strip():
+                            fm.add(" ".join(x for x in (
+                                f"{r['sz']:g}pt" if r.get("sz") else "", "bold" if r.get("b") else "",
+                                "italic" if r.get("i") else "", "underline" if r.get("u") else "",
+                                f"#{r['c']}" if r.get("c") else "") if x) or "既定")
+                put(t, "fonts", ", ".join(sorted(fm)))
+                put(t, "align", ", ".join(sorted({p["al"] for p in s["paras"] if p["al"]})))
+            for ri, row in enumerate(s.get("table", []), 1):
+                for ci, cell in enumerate(row, 1):
+                    put(t, f"cell:{ri},{ci}", flat(cell))
+            if "chart" in s:
+                put(t, "chart.type", s["chart"]["type"])
+                put(t, "chart.title", s["chart"]["title"])
+                for i, se in enumerate(s["chart"]["series"], 1):
+                    put(t, f"series{i}.name", se["name"])
+                    put(t, f"series{i}.categories", ", ".join(se["cats"]))
+                    put(t, f"series{i}.values", ", ".join(str(v) for v in se["vals"]))
+    return props, order
 
 
 def kind_of(target):
@@ -370,14 +593,16 @@ def diff_workbooks(old, new):
     op, o_order = snapshot(old) if old else ({}, [])
     np_, n_order = snapshot(new) if new else ({}, [])
     lines = []
+    noun = "スライド" if any(k[1] == "slide" for k in list(op) + list(np_)) else "シート"
+    lab = lambda key: np_.get((key, "slide", "_label")) or op.get((key, "slide", "_label")) or key
     for name in o_order:
         if name not in n_order:
-            lines.append(f"- シート削除: {name}")
+            lines.append(f"- {noun}削除: {lab(name)}")
     for name in n_order:
         if name not in o_order:
-            lines.append(f"+ シート追加: {name}")
+            lines.append(f"+ {noun}追加: {lab(name)}")
     if [s for s in o_order if s in n_order] != [s for s in n_order if s in o_order]:
-        lines.append("~ シートの順序が変更されました")
+        lines.append(f"~ {noun}の順序が変更されました")
 
     chart_lines = 0
     for name in [s for s in n_order if s in o_order] + [WB]:
@@ -387,12 +612,16 @@ def diff_workbooks(old, new):
         for t in targets:
             if t == "chart-xml":
                 continue
-            op_t = {p: v for (tt, p), v in o.items() if tt == t}
-            np_t = {p: v for (tt, p), v in n.items() if tt == t}
+            op_t = {p: v for (tt, p), v in o.items() if tt == t and not p.startswith("_")}
+            np_t = {p: v for (tt, p), v in n.items() if tt == t and not p.startswith("_")}
             if op_t == np_t:
                 continue
             kind = kind_of(t)
-            loc = t if name == WB else f"{name}!{t}"
+            if name == WB:
+                loc = t
+            else:
+                nm = np_t.get("name") or op_t.get("name")
+                loc = f"{lab(name)}!{t}" + (f"({nm})" if t.startswith("shape:") and nm else "")
             if kind == "グラフ":
                 chart_lines += 1
             groups = [(None, ("value",)), (kind, None)] if kind == "書式等" else [(kind, None)]
@@ -447,8 +676,8 @@ def cmd_init(args):
     root = repo_root()
     ga = os.path.join(root, ".gitattributes")
     existing = open(ga).read() if os.path.exists(ga) else ""
-    add = "".join(f"*{e} diff=xlsx -merge -text\n" for e in EXCEL_EXT
-                  if f"*{e} diff=xlsx" not in existing)
+    add = "".join(f"*{e} diff=office -merge -text\n" for e in OFFICE_EXT
+                  if f"*{e} diff=" not in existing)
     if add:
         with open(ga, "a") as f:
             f.write(add)
@@ -458,8 +687,9 @@ def cmd_init(args):
     if "~$*" not in gi_text:
         with open(gi, "a") as f:
             f.write("~$*\n.~lock.*#\n")
-    git("config", "diff.xlsx.textconv", f'python3 "{SELF}" textconv')
-    git("config", "diff.xlsx.cachetextconv", "false")
+    for drv in ("office", "xlsx"):  # xlsx は旧バージョンのリポジトリ互換
+        git("config", f"diff.{drv}.textconv", f'python3 "{SELF}" textconv')
+        git("config", f"diff.{drv}.cachetextconv", "false")
     print(f"初期化しました: {root}")
     print("  - .gitattributes / .gitignore を設定")
     print("  - git diff でセル内容が表示されるよう textconv を登録")
@@ -518,7 +748,7 @@ def cmd_diff(args):
             names |= set(git(*base, old_rev, new_rev, capture=True).decode().split("\0"))
         else:
             names |= set(git(*base, old_rev, capture=True).decode().split("\0"))
-        paths = sorted(n for n in names if n.lower().endswith(EXCEL_EXT))
+        paths = sorted(n for n in names if n.lower().endswith(OFFICE_EXT))
 
     if not paths:
         print("Excelファイルの変更はありません")
@@ -546,7 +776,7 @@ def cmd_show(args):
     parent = f"{rev}^"
     paths = [n for n in git("diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
                             "--root", rev, capture=True).decode().split("\0")
-             if n.lower().endswith(EXCEL_EXT)]
+             if n.lower().endswith(OFFICE_EXT)]
     for p in paths:
         print(f"--- {p}")
         for ln in diff_workbooks(git_show(parent, p), git_show(rev, p)):
@@ -641,10 +871,86 @@ def read_version(rev, path):
     return git_show(rev, path)
 
 
+import base64
+
+
+def web_shape(s):
+    d = {k: v for k, v in s.items() if not k.startswith("_")}
+    blob = s.get("_blob")
+    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif", "bmp": "bmp",
+            "webp": "webp"}.get(str(s.get("_ext", "")).lower())
+    if blob and mime and len(blob) <= 2_000_000:
+        d["img"] = f"data:image/{mime};base64," + base64.b64encode(blob).decode()
+    return d
+
+
+def web_slide(sl, deck):
+    if sl is None:
+        return None
+    return {"w": deck["w"], "h": deck["h"], "bg": sl["bg"],
+            "shapes": [web_shape(s) for s in sl["shapes"]]}
+
+
+def _short(v, n=60):
+    v = str(v)
+    return v if len(v) <= n else v[:n - 1] + "…"
+
+
+def pptx_changes(po, pn, key):
+    """スライド内の変更を [{id, s(add/del/mod/fmt), name, desc}] で返す"""
+    def pick(props):
+        out = {}
+        for (k, t, p), v in props.items():
+            if k == key and not p.startswith("_"):
+                out.setdefault(t, {})[p] = v
+        return out
+    o, n = pick(po), pick(pn)
+    order = lambda t: (t != "slide", int(t.split(":")[1]) if t.startswith("shape:") else 0)
+    out = []
+    for t in sorted(set(o) | set(n), key=order):
+        a, b = o.get(t, {}), n.get(t, {})
+        if a == b:
+            continue
+        sid = "slide" if t == "slide" else t.split(":")[1]
+        name = "スライド設定" if t == "slide" else (b.get("name") or a.get("name") or t)
+        if not a:
+            s, desc = "add", "追加: " + _short(b.get("text") or b.get("kind", ""))
+        elif not b:
+            s, desc = "del", "削除: " + _short(a.get("text") or a.get("kind", ""))
+        else:
+            ps = [p for p in sorted(set(a) | set(b)) if a.get(p) != b.get(p)]
+            s = "mod" if any(p.startswith(CONTENT_PREFIX) for p in ps) or t == "slide" else "fmt"
+            desc = "; ".join(f"{p}: {_short(a.get(p, '(なし)'))} → {_short(b.get(p, '(なし)'))}" for p in ps)
+        out.append({"id": sid, "s": s, "name": name, "desc": desc})
+    return out
+
+
+def web_diff_pptx(old, new, old_rev, new_rev, path):
+    do = read_pptx(old) if old else {"slides": [], "w": 0, "h": 0}
+    dn = read_pptx(new) if new else {"slides": [], "w": 0, "h": 0}
+    po = snapshot_pptx(old)[0] if old else {}
+    pn = snapshot_pptx(new)[0] if new else {}
+    so = {s["key"]: s for s in do["slides"]}
+    sn = {s["key"]: s for s in dn["slides"]}
+    keys = [s["key"] for s in dn["slides"]] + [k for k in so if k not in sn]
+    sheets = []
+    for k in keys:
+        a, b = so.get(k), sn.get(k)
+        sheets.append({"name": k, "label": (b or a)["label"],
+                       "status": "added" if a is None else "removed" if b is None else "same",
+                       "old": web_slide(a, do), "new": web_slide(b, dn),
+                       "changes": pptx_changes(po, pn, k)})
+    others = [l for l in diff_workbooks(old, new) if re.match(r"^[+\-~] スライド", l)]
+    return {"kind": "pptx", "path": path, "old": old_rev, "new": new_rev, "sheets": sheets,
+            "others": others, "old_exists": old is not None, "new_exists": new is not None}
+
+
 def web_diff(old_rev, new_rev, path):
     old, new = read_version(old_rev, path), read_version(new_rev, path)
     if old is None and new is None:
         raise FileNotFoundError(f"どちらのバージョンにも {path} がありません")
+    if is_pptx(old) or is_pptx(new):
+        return web_diff_pptx(old, new, old_rev, new_rev, path)
     os_, oo = build_web_book(old)
     ns, no = build_web_book(new)
     names = list(no) + [n for n in oo if n not in no]
@@ -682,7 +988,7 @@ def web_changed(old_rev, new_rev):
     else:
         nb = "4b825dc642cb6eb9a060e54bf8d69288fbee4904" if new_rev == "EMPTY" else new_rev
         names |= set(run("diff", "--name-only", "--no-renames", "-z", ob, nb))
-    return sorted(n for n in names if n.lower().endswith(EXCEL_EXT))
+    return sorted(n for n in names if n.lower().endswith(OFFICE_EXT))
 
 
 def valid_rev(r):
@@ -693,7 +999,7 @@ def valid_path(p):
     if not p or p.startswith("/") or "\0" in p:
         return False
     parts = p.replace("\\", "/").split("/")
-    return ".." not in parts and p.lower().endswith(EXCEL_EXT)
+    return ".." not in parts and p.lower().endswith(OFFICE_EXT)
 
 
 class WebHandler(BaseHTTPRequestHandler):
@@ -792,6 +1098,17 @@ table.grid{border-collapse:collapse;table-layout:fixed}
 .oth{cursor:default;font-family:ui-monospace,monospace;font-size:11px}
 .add{color:#2da44e}.del{color:#cf222e}.mod{color:#bf8700}
 #msg{padding:30px;color:var(--mut)}
+.pv{padding:10px;max-width:1000px;margin:auto}.slide{position:relative;container-type:inline-size;width:100%;color:#222;box-shadow:0 1px 6px rgba(0,0,0,.3);overflow:hidden}
+.sp{position:absolute;overflow:hidden;box-sizing:border-box}.sp img{width:100%;height:100%;object-fit:contain;display:block}
+.sp .tx{padding:.3cqw .6cqw}.sp p{margin:0;line-height:1.2;white-space:pre-wrap}
+.sp .tb{border-collapse:collapse;width:100%;font-size:1.6cqw}.sp .tb td{border:1px solid #999;padding:2px 4px;background:#fff}
+.sp .ch{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;background:#f0f4f8;border:1px dashed #889;font-size:2cqw;color:#345;text-align:center}
+.sp::after{content:'';position:absolute;inset:0;pointer-events:none}
+.sp.s-add::after{background:rgba(46,160,67,.28);box-shadow:inset 0 0 0 3px #2da44e}
+.sp.s-del::after{background:rgba(207,34,46,.28);box-shadow:inset 0 0 0 3px #cf222e}
+.sp.s-mod::after{background:rgba(255,213,0,.35);box-shadow:inset 0 0 0 3px #d4a72c}
+.sp.s-fmt::after{box-shadow:inset 0 0 0 3px #2f81f7}.sp.flash::after{box-shadow:inset 0 0 0 6px #f0883e}
+.gw .gt+.pv{padding-top:2px}
 </style></head><body>
 <div id="side"><h2>コミット履歴 <button id="rf" title="再読み込み">↻</button></h2><div id="commits"></div></div>
 <div id="main">
@@ -873,10 +1190,11 @@ function grid(sh,cmp,side,ids){
 }
 function render(){
  const d=S.data;if(!d){return}
- $('#tabs').innerHTML=d.sheets.map((sh,i)=>`<div class="tab ${sh.name===S.sheet?'on':''} ${sh.status}" data-n="${esc(sh.name)}">${esc(sh.name)}${sh._c.count?`<span class="n">${sh._c.count}</span>`:''}</div>`).join('');
+ $('#tabs').innerHTML=d.sheets.map((sh,i)=>`<div class="tab ${sh.name===S.sheet?'on':''} ${sh.status}" data-n="${esc(sh.name)}">${esc(sh.label||sh.name)}${sh._c.count?`<span class="n">${sh._c.count}</span>`:''}</div>`).join('');
  document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{S.sheet=t.dataset.n;render()});
  const sh=d.sheets.find(s=>s.name===S.sheet)||d.sheets[0];if(!sh){$('#grids').innerHTML='<div id="msg">シートがありません</div>';return}
  const cmp=sh._c;
+ if(d.kind==='pptx')return pptxRender(d,sh);
  if(S.mode==='side'){
   $('#grids').innerHTML=`<div class="gw" id="g1"><div class="gt">比較元 ${esc(lab(d.old))}${sh.old?'':'(なし)'}</div>${grid(sh,cmp,'old',false)}</div><div class="gw" id="g2"><div class="gt">比較先 ${esc(lab(d.new))}${sh.new?'':'(なし)'}</div>${grid(sh,cmp,'new',true)}</div>`;
   const a=$('#g1'),b=$('#g2');let lock=false;
@@ -891,6 +1209,37 @@ function render(){
   return`<div class="li" data-c="${c}">${lab} <b>${c}</b> ${v}</div>`}).join('')||'<div class="li oth">このシートにセルの変更はありません</div>';
  document.querySelectorAll('#pl .li[data-c]').forEach(l=>l.onclick=()=>{const el=document.getElementById('c-'+l.dataset.c);if(el){el.scrollIntoView({block:'center',inline:'center'});el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash')}});
  $('#po').innerHTML=d.others.map(l=>`<div class="li oth ${l[0]==='+'?'add':l[0]==='-'?'del':'mod'}">${esc(l)}</div>`).join('')||'<div class="li oth">変更なし</div>';
+}
+function runCss(r,W){const a=[];const sz=r.sz||18;a.push(`font-size:${(sz*12700/W*100).toFixed(3)}cqw`);
+ if(r.b)a.push('font-weight:700');if(r.i)a.push('font-style:italic');if(r.u)a.push('text-decoration:underline');if(r.c&&/^[0-9A-Fa-f]{6}$/.test(r.c))a.push('color:#'+r.c);return a.join(';')}
+function spHtml(s,W,H,cls,c){
+ let st=`left:${s.x/W*100}%;top:${s.y/H*100}%;width:${s.w/W*100}%;height:${s.h/H*100}%;`;
+ if(s.rot)st+=`transform:rotate(${s.rot}deg);`;if(s.fill&&/^[0-9A-Fa-f]{6}$/.test(s.fill))st+=`background:#${s.fill};`;
+ if(s.line&&/^[0-9A-Fa-f]{6}$/.test(s.line))st+=`border:${((s.lw||1)*12700/W*100).toFixed(3)}cqw solid #${s.line};`;
+ let inner='';
+ if(s.img)inner=`<img src="${s.img}">`;
+ else if(s.table)inner='<table class="tb">'+s.table.map(r=>'<tr>'+r.map(t=>`<td>${esc(t)}</td>`).join('')+'</tr>').join('')+'</table>';
+ else if(s.chart)inner=`<div class="ch"><div>📊 ${esc(s.chart.type)}${s.chart.title?' : '+esc(s.chart.title):''}</div><small>${esc(s.chart.series.map(x=>x.name).join(', '))}</small></div>`;
+ else if(s.kind==='picture')inner='<div class="ch">🖼 画像</div>';
+ else if(s.paras)inner='<div class="tx">'+s.paras.map(p=>`<p style="text-align:${({CENTER:'center',RIGHT:'right',JUSTIFY:'justify'})[p.al]||'left'}">`+(p.runs.length?p.runs.map(r=>r.t==='\n'?'<br>':`<span style="${runCss(r,W)}">${esc(r.t)}</span>`).join(''):'&nbsp;')+'</p>').join('')+'</div>';
+ const tp=esc(s.name+(c?'\n'+c.desc:''));
+ return`<div id="sp-${s.id}" class="sp ${cls}" style="${st}" title="${tp}">${inner}</div>`}
+function pptxRender(d,sh){
+ const ch=new Map(sh.changes.map(c=>[String(c.id),c]));
+ const mk=(sl,side)=>{if(!sl)return'<div id="msg">(このバージョンには存在しません)</div>';
+  const list=sl.shapes.slice();
+  if(side==='overlay'&&sh.new&&sh.old)for(const s of sh.old.shapes){const c=ch.get(String(s.id));if(c&&c.s==='del')list.push(s)}
+  const html=list.map(s=>{const c=ch.get(String(s.id));let cls='';
+   if(c){if(side==='old')cls=c.s==='add'?'':'s-'+c.s;else if(side==='new')cls=c.s==='del'?'':'s-'+c.s;else cls='s-'+c.s}
+   return spHtml(s,sl.w,sl.h,cls,c)}).join('');
+  return`<div class="pv"><div class="slide" style="aspect-ratio:${sl.w}/${sl.h};background:${sl.bg&&/^[0-9A-Fa-f]{6}$/.test(sl.bg)?'#'+sl.bg:'#fff'}">${html}</div></div>`};
+ if(S.mode==='side')$('#grids').innerHTML=`<div class="gw"><div class="gt">比較元 ${esc(lab(d.old))}</div>${mk(sh.old,'old')}</div><div class="gw"><div class="gt">比較先 ${esc(lab(d.new))}</div>${mk(sh.new,'new')}</div>`;
+ else $('#grids').innerHTML=`<div class="gw">${mk(sh.new||sh.old,'overlay')}</div>`;
+ $('#ph').textContent=`変更一覧 (${sh.label||sh.name}: ${sh.changes.length}件)`;
+ const icon={add:'<span class="add">＋</span>',del:'<span class="del">－</span>',mod:'<span class="mod">～</span>',fmt:'<span style="color:var(--fmt)">書</span>'};
+ $('#pl').innerHTML=sh.changes.map(c=>`<div class="li" data-id="${esc(c.id)}">${icon[c.s]} <b>${esc(c.name)}</b><br><span style="color:var(--mut)">${esc(c.desc)}</span></div>`).join('')||'<div class="li oth">このスライドに変更はありません</div>';
+ document.querySelectorAll('#pl .li[data-id]').forEach(l=>l.onclick=()=>{const el=document.getElementById('sp-'+l.dataset.id);if(el){el.scrollIntoView({block:'center'});el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash')}});
+ $('#po').innerHTML=d.others.map(l=>`<div class="li oth ${l[0]==='+'?'add':l[0]==='-'?'del':'mod'}">${esc(l)}</div>`).join('')||'<div class="li oth">スライドの増減・順序の変更なし</div>';
 }
 const lab=r=>r==='WORKING'?'作業ツリー':r==='EMPTY'?'(空)':(S.commits.find(c=>c.hash===r)||{short:r}).short;
 function fillSelects(){
@@ -917,7 +1266,7 @@ async function reload(){
   if(!f.length){S.data=null;$('#tabs').innerHTML='';$('#grids').innerHTML='<div id="msg">この範囲にExcelファイルの変更はありません</div>';$('#pl').innerHTML='';$('#po').innerHTML='';return}
   if(!f.includes(S.path))S.path=f[0];$('#sf').value=S.path;
   const d=await api(`/api/diff?old=${enc(S.old)}&new=${enc(S.nw)}&path=${enc(S.path)}`);
-  d.sheets.forEach(sh=>sh._c=compute(sh));S.data=d;
+  d.sheets.forEach(sh=>sh._c=d.kind==='pptx'?{count:sh.changes.length,m:new Map(),mr:0,mc:0}:compute(sh));S.data=d;
   if(!d.sheets.some(s=>s.name===S.sheet))S.sheet=(d.sheets.find(s=>s._c.count)||d.sheets[0]||{}).name;
   render();
  }catch(e){$('#grids').innerHTML=`<div id="msg">エラー: ${esc(e.message)}</div>`}
